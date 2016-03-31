@@ -1,0 +1,573 @@
+#!/bin/bash
+VERSION=1.1.0
+
+USERNAME=$(whoami)
+CANON_REPO=https://github.com/starkandwayne/hangar
+HANGAR_DIR="${HOME}/.hangar"
+
+# Options
+opt_target=${CONCOURSE_TARGET}
+opt_pause_after_restore='a'
+opt_dir="${HANGAR_DIR}/backups"
+opt_clean=""
+target_pipelines=()
+
+####################################################
+# pipelines and backups info
+
+declare -a pipelines pipeline_states
+
+get_pipelines() {
+  local pipeline_info
+  local name
+  local state
+
+  pipeline_info="$(${HANGAR_DIR}/fly -t $opt_target pipelines)"
+  if [[ "$?" -ne 0 ]]
+  then
+    fatal \
+      "Could not retrieve pipelines from $opt_target:" \
+      $pipeline_info
+    exit 1
+  fi
+
+  pipelines=()
+  pipeline_states=()
+  while read name state
+  do
+    pipelines+=("$name")
+    pipeline_states+=("$state")
+  done < <(echo "$pipeline_info" | tail -n +1)
+}
+
+declare -a backups backup_states
+
+get_backups() {
+  local backup_files
+  local name
+  local state
+
+  pushd $opt_backup_dir
+  backup_files=(*.yml)
+  backups=()
+  backup_states=()
+  for file in "${backup_files[@]}"
+  do
+    name="$( echo "$file" | sed -e 's/\.yml$//' )"
+    if [[ -f "${name}.state" ]]
+      state="$(cat ${name}.state)"
+    else
+      state="unknown"
+    fi
+
+    backups+=("$name")
+    backup_states+=("$state")
+  done
+  popd 
+}
+
+
+pipeline_state() {
+  name=$1
+  index="(echo ${pipelines[@]/${name}//} | cut -d/ -f1 | wc -w | tr -d ' ')"
+  echo "${pipeline_states[$index]}"
+}
+
+pipeline_exists() {
+  name=$1
+  index="(echo ${pipelines[@]/${name}//} | cut -d/ -f1 | wc -w | tr -d ' ')"
+  [[ $index -lt ${#pipelines[@]} ]]
+}
+
+backup_state() {
+  name=$1
+  index="(echo ${backups[@]/${name}//} | cut -d/ -f1 | wc -w | tr -d ' ')"
+  echo "${backup_states[$index]}"
+}
+
+backup_exists() {
+  name=$1
+  index="(echo ${backups[@]/${name}//} | cut -d/ -f1 | wc -w | tr -d ' ')"
+  [[ $index -lt ${#backups[@]} ]]
+}
+
+
+####################################################
+# checks and validating functions
+
+need_command() {
+  local cmd=${1:?need_command() - no command name given}
+
+  if [[ ! -x "$(command -v $cmd)" ]]; then
+    fatal "${cmd} is not installed."
+  fi
+}
+
+check_target() {
+  if [[ -z "$opt_target" ]]
+  then
+    fatal "No target specified.  Please set in \$CONCOURSE_TARGET or use the -t|--target option"
+  fi
+
+  yaml="$(parse_yaml ~/.flyrc fly_)"
+  fly_url="$(echo "$yaml" | grep fly_targets_${opt_target}_api | sed -E 's/^.*?="(.*)"$/\1/')"
+
+  results="$(curl ${fly_url})"
+  if [[ $? -ne 0 ]]
+  then
+    fatal "Cannot reach Concourse target at ${fly_url}"
+  fi
+}
+
+need_dirs() {
+  if [[ ! -d "$HANGAR_DIR" ]]
+  then
+    mkdir -p "${HANGAR_DIR}"
+  fi
+
+  mkdir -p -- "$opt_backup_dir"
+}
+
+need_fly() {
+
+  echo "Updating ${HANGAR_DIR}/fly to the matching version for the target"
+  yaml="$(parse_yaml ~/.flyrc fly_)"
+  fly_url="$(echo "$yaml" | grep fly_targets_${opt_target}_api | sed -E 's/^.*?="(.*)"$/\1/')"
+  fly_token_type="$(echo "$yaml" | grep fly_targets_${opt_target}_token_type | sed -E 's/^.*?="(.*)"$/\1/')"
+  fly_token="$(echo "$yaml" | grep fly_targets_${opt_target}_token_value | sed -E 's/^.*?="(.*)"$/\1/')"
+
+  if [[ "$fly_token_type" != "Bearer" ]]
+  then
+    echo "WARNING: Cannot manually update ${HANGAR_DIR}/fly -- please manually download it"
+    echo "Try to continue anyways? (y/N)"
+    read can_continue
+    if [[ "$can_continue" != "y" ]]
+    then
+      exit 2
+    fi
+  else
+    set -e
+    curl "${fly_url}/api/v1/cli?arch=amd64&platform=linux" -o ${HANGAR_DIR}/fly --oauth2-bearer "$fly_token"
+    set +e
+    chmod u+x  ${HANGAR_DIR}/fly
+  fi
+
+  if [[ ! -x  ${HANGAR_DIR}/fly ]]
+  then
+    echo "ERROR: ${HANGAR_DIR}/fly not found or not executable -- cannot continue."
+    exit 1
+  fi
+}
+
+
+####################################################
+# parser functions
+
+parse_opts() {
+  local arg
+  while (( $# )); do
+    arg=$1 ; shift
+    case ${arg} in
+    (-t|--target)
+      opt_target="$1"
+      shift
+      ;;
+    (-p|--path)
+      opt_dir="$1"
+      shift
+      ;;
+    (*)
+      cmd_opt_parser="${action}_opt_parser"
+      offset=0
+      if command -V $cmd_opt_parser | grep "is a function" 2>/dev/null 1>&2
+      then
+        offset="$($cmd_opt_parser $arg $*)"
+      fi
+      if [[ "$offset" -eq 0 ]]
+        echo "Unknown option '$arg'"
+        exit 1
+      fi
+      while (( offset = offset - 1 ))
+      do
+        shift;;
+      done
+      ;;
+    esac
+  done
+}
+
+cmd_backup_option_parser() {
+  local arg
+  arg=$1 ; shift
+  case ${arg} in
+    (-P|--pause)
+      opt_pause_first=true
+      echo 1
+      ;;
+    (-c|--clean)
+      opt_clean=true
+      echo 1
+      ;;
+    (-*)
+      echo 0
+      ;;
+    (*)
+      target_pipelines+=($arg)
+      echo 1
+      ;;
+  esac
+}
+
+cmd_restore_option_parser() {
+  local arg
+  local opt
+  arg=$1 ; shift
+  case ${arg} in
+    (-P|--pause)
+      opt=$1
+      case ${opt} in
+        (y|yes|n|no|a|auto)
+          opt_pause_after_restore="${opt:0:1}"
+          ;;
+        (*)
+          fatal "Error: $arg expects (y)es, (n)o or (a)uto"
+          ;;
+      esac
+      echo 2
+      ;;
+    (-c|--clean)
+      opt_clean=true
+      echo 1
+      ;;
+    (-missing)
+      opt_restore_missing=true
+      echo 1
+      ;;
+    (-*)
+      echo 0
+      ;;
+    (*)
+      target_pipelines+=($arg)
+      echo 1
+      ;;
+  esac
+}
+
+####################################################
+# common functions used by other parts of hangar
+
+fatal() {
+  for msg in $@
+  do
+    echo >&2 $msg
+  done
+  exit 1
+}
+
+parse_yaml() {
+   local prefix=$2
+   local s='[[:space:]]*' w='[-a-zA-Z0-9_]*' fs=$(echo @|tr @ '\034')
+   sed -ne "s|^\($s\)\($w\)$s:$s\"\(.*\)\"$s\$|\1$fs\2$fs\3|p" \
+        -e "s|^\($s\)\($w\)$s:$s\(.*\)$s\$|\1$fs\2$fs\3|p"  $1 |
+   awk -F$fs '{
+      indent = length($1)/2;
+      vname[indent] = $2;
+      for (i in vname) {if (i > indent) {delete vname[i]}}
+      if (length($3) > 0) {
+         vn=""; for (i=0; i<indent; i++) {vn=(vn)(vname[i])("_")}
+         printf("%s%s%s=\"%s\"\n", "'$prefix'",vn, $2, $3);
+      }
+   }'
+}
+
+
+
+####################################################
+# multi-call handlers
+
+cmd_help() {
+  local topic=${1:-usage}
+
+  case ${topic} in
+  (usage)
+    cat >&2 <<EOF
+USAGE: hangar <command> [arguments]
+
+Common commands:
+
+    hangar clean               Expunge the given (or default) backup directory
+
+    hangar backup              Backup all pipelines
+
+    hangar refresh             Restore pipelines
+
+    hangar contents            List the backed up pipelines
+
+    hangar help                Peruse the help!  Give it a topic argument, or the name
+                                of another command to get more detailed information.
+                                Documentation!
+
+EOF
+    exit 0
+    ;;
+  (clean)
+    cat >&2 <<EOF
+USAGE: hangar new deployment NAME
+       hangar new site SITE
+       hangar new environment SITE ENVIRONMENT
+
+Creates new things, with all the right files in all the right places.
+
+
+EOF
+    exit 0
+    ;;
+  (backup)
+    cat >&2 <<EOF
+USAGE: hangar build
+
+Compiles all of the YAML templates down to a single BOSH manifest
+for the current environment.
+
+EOF
+    exit 0
+    ;;
+  (restore)
+    cat >&2 <<EOF
+USAGE: hangar refresh [(global|site|all|makefile|readme)]
+
+Copies current definitions of the global templates and/or the
+current site into the current environment.  By default, copies both.
+
+The argument 'makefile' only rebuilds the Makefile for an environment,
+which can be useful to bring old deployments in-line with newer versions
+of hangar.
+
+Similarly, 'readme' only recreates the various README files for the top-level,
+the global/ directories, and all sites and environments.
+
+EOF
+    exit 0
+    ;;
+  (*)
+    cat >&2 <<EOF
+Unrecognized help topic '${topic}'.
+Try one of these:
+
+    hangar help usage
+    hangar help <command>
+
+EOF
+    exit 0
+    ;;
+  esac
+  exit 1
+}
+
+cmd_clean() {
+
+  local backup
+
+  need_dirs
+  get_backups
+
+  for backup in ${backups[@]}
+  do
+    rm $opt_dir/$backup.yml
+    rm $opt_dir/$backup.state
+  done
+  backups=()
+}
+
+cmd_backup() {
+
+  local pipeline
+  local result
+
+  need_dirs
+  check_target
+  nead_fly
+
+  if [[ -n "$opt_clean" ]]
+  then
+    cmd_clean
+  fi
+
+  check_backup_directory_empty
+
+  get_pipelines
+  if [[ ${#target_pipelines[@]} -gt 0 ]]
+  then
+    for pipeline in "${target_pipelines[@]}"
+    do
+      if ! pipeline_exists $pipeline
+      then
+        fatal "$pipeline does not exist on specified Concourse target"
+      fi
+    done
+  else
+    target_pipelines=("${pipelines[@]}")
+  fi
+
+  for pipeline in "${target_pipelines[@]}"
+  do
+    if [[ -n "$opt_pause_first" ]]
+    then 
+      result="$(${HANGAR_DIR}/fly -t "$opt_target" pause-pipeline -p $pipeline)"
+      if [[ "$?" -ne 0 ]]
+      then
+        fatal "Could not pause pipeline ${pipeline}: $result"
+      fi
+    fi
+    result="$(${HANGAR_DIR}/fly -t "$opt_target" get-pipeline -p $pipeline)"
+    if [[ "$?" -ne 0 ]]
+    then
+      fatal "Could not fetch pipeline ${pipeline}: $result"
+    fi
+    echo result > ${opt_dir}/${pipeline}.yml
+    pipeline_state $pipeline > ${opt_dir}/${pipeline}.state
+  done
+}
+
+cmd_restore() {
+
+  local pipeline
+  local result
+
+  need_dirs
+  check_target
+  nead_fly
+
+  get_backups
+  if [[ ${#target_pipelines[@]} -gt 0 ]]
+  then
+    for pipeline in "${target_pipelines[@]}"
+    do
+      if ! backup_exists $pipeline
+      then
+        fatal "$pipeline does not exist on specified Concourse target"
+      fi
+    done
+  elif [[ -n "$opt_restore_missing" ]]
+    local missing_pipelines=()
+    get_pipelines
+    for pipeline in "${backups[@]}"
+    do
+      if ! pipeline_exists $pipeline
+      then
+        missing_pipelines+=($pipeline)
+      fi
+    done
+    target_pipelines=("${missing_pipelines[@]}")
+  else
+    target_pipelines=("${backups[@]}")
+  fi
+
+  for pipeline in "${target_pipelines[@]}"
+  do
+    result="$(${HANGAR_DIR}/fly -t "$opt_target" set-pipeline -p $pipeline -c ${opt_dir}/${pipeline}.yml)"
+    if [[ "$?" -ne 0 ]]
+    then
+      fatal "Could not set pipeline ${pipeline}: $result"
+    fi
+
+    local pause_cmd
+    pipeline_state="$(cat "${opt_dir}/${pipeline}.state")"
+    case ${opt_pause_after_restore/a/$pipeline_state} in
+      (y|yes)
+        pause_cmd="pp"
+        ;;
+      (n|no)
+        pause_cmd="up"
+        ;;
+      (*)
+        pause_cmd=""
+        ;;
+    esac
+    if [[ -n "$pause_cmd" ]]
+    then
+      result="$(${HANGAR_DIR}/fly -t "$opt_target" $pause_cmd -p $pipeline)"
+      if [[ "$?" -ne 0 ]]
+      then
+        fatal "Could not pause pipeline ${pipeline}: $result"
+      fi
+    fi
+
+    if [[ -n "$opt_clean" ]]
+    then
+      rm ${opt_dir}/${pipeline}.yml
+      rm ${opt_dir}/${pipeline}.state
+    fi
+
+  done
+}
+
+bad_command() {
+  local cmd=${1}
+  cat >&2 <<EOF
+Unrecognized sub-command: '$cmd'
+
+Try one of these:
+
+   hangar help
+   hangar version
+   hangar clean
+   hangar backup
+   hangar restore
+
+EOF
+  exit 1
+}
+
+checksum() {
+  if [[ -z $(command -v sha1sum) ]]; then
+    shasum "$@"
+  else
+    sha1sum "$@"
+  fi
+}
+
+####################################################
+# multi-call interface
+
+main() {
+  local cmd_name=${1:-help} ; shift
+  action=''
+
+  case ${cmd_name} in
+  (ping)
+    exit 0
+    ;;
+  (version|-v|--version)
+    s=$(cat ${BASH_SOURCE[0]} | checksum)
+    echo "hangar v${VERSION} (${s:0:12})"
+    exit 0
+    ;;
+  (help|-h|--help|-?)
+    cmd_help $*
+    exit 0
+    ;;
+  (clean)
+    # Delete all existing backups
+    action=cmd_backup
+    ;;
+  (backup)
+    # Backup the pipelines
+    action=cmd_backup
+    ;;
+  (restore)
+    # Restore the pipelines
+    action=cmd_restore_all
+    ;;
+  esac
+  if [[ -z "${action}" ]]
+    bad_command ${cmd_name}
+  fi
+
+  parse_opts
+  $action
+}
+
+main $@
+
+# fin
