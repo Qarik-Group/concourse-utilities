@@ -55,6 +55,7 @@ get_backups() {
   do
     name="$( echo "$file" | sed -e 's/\.yml$//' )"
     if [[ -f "${name}.state" ]]
+    then
       state="$(cat ${name}.state)"
     else
       state="unknown"
@@ -65,7 +66,6 @@ get_backups() {
   done
   popd 
 }
-
 
 pipeline_state() {
   name=$1
@@ -98,33 +98,21 @@ backup_exists() {
 need_command() {
   local cmd=${1:?need_command() - no command name given}
 
-  if [[ ! -x "$(command -v $cmd)" ]]; then
-    fatal "${cmd} is not installed."
-  fi
+  [[ -x "$(command -v $cmd)" ]] || fatal "${cmd} is not installed."
 }
 
 check_target() {
-  if [[ -z "$opt_target" ]]
-  then
-    fatal "No target specified.  Please set in \$CONCOURSE_TARGET or use the -t|--target option"
-  fi
+  [[ -n "$opt_target" ]] || fatal "No target specified.  Please set in \$CONCOURSE_TARGET or use the -t|--target option"
 
   yaml="$(parse_yaml ~/.flyrc fly_)"
   fly_url="$(echo "$yaml" | grep fly_targets_${opt_target}_api | sed -E 's/^.*?="(.*)"$/\1/')"
 
   results="$(curl ${fly_url})"
-  if [[ $? -ne 0 ]]
-  then
-    fatal "Cannot reach Concourse target at ${fly_url}"
-  fi
+  [[ $? -eq 0 ]] || fatal "Cannot reach Concourse target at ${fly_url}"
 }
 
 need_dirs() {
-  if [[ ! -d "$HANGAR_DIR" ]]
-  then
-    mkdir -p "${HANGAR_DIR}"
-  fi
-
+  [[ -d "$HANGAR_DIR" ]] || mkdir -p "${HANGAR_DIR}"
   mkdir -p -- "$opt_backup_dir"
 }
 
@@ -141,10 +129,7 @@ need_fly() {
     echo "WARNING: Cannot manually update ${HANGAR_DIR}/fly -- please manually download it"
     echo "Try to continue anyways? (y/N)"
     read can_continue
-    if [[ "$can_continue" != "y" ]]
-    then
-      exit 2
-    fi
+    [[ "$can_continue" == "y" ]] ||  exit 2
   else
     set -e
     curl "${fly_url}/api/v1/cli?arch=amd64&platform=linux" -o ${HANGAR_DIR}/fly --oauth2-bearer "$fly_token"
@@ -152,11 +137,7 @@ need_fly() {
     chmod u+x  ${HANGAR_DIR}/fly
   fi
 
-  if [[ ! -x  ${HANGAR_DIR}/fly ]]
-  then
-    echo "ERROR: ${HANGAR_DIR}/fly not found or not executable -- cannot continue."
-    exit 1
-  fi
+  [[ -x  ${HANGAR_DIR}/fly ]] || fatal "ERROR: ${HANGAR_DIR}/fly not found or not executable -- cannot continue."
 }
 
 
@@ -183,10 +164,7 @@ parse_opts() {
       then
         offset="$($cmd_opt_parser $arg $*)"
       fi
-      if [[ "$offset" -eq 0 ]]
-        echo "Unknown option '$arg'"
-        exit 1
-      fi
+      [[ "$offset" -gt 0 ]] || fatal "Unknown option '$arg'"
       while (( offset = offset - 1 ))
       do
         shift;;
@@ -443,10 +421,7 @@ cmd_restore() {
   then
     for pipeline in "${target_pipelines[@]}"
     do
-      if ! backup_exists $pipeline
-      then
-        fatal "$pipeline does not exist on specified Concourse target"
-      fi
+      backup_exists $pipeline || fatal "$pipeline does not exist on specified Concourse target"
     done
   elif [[ -n "$opt_restore_missing" ]]
     local missing_pipelines=()
@@ -466,10 +441,7 @@ cmd_restore() {
   for pipeline in "${target_pipelines[@]}"
   do
     result="$(${HANGAR_DIR}/fly -t "$opt_target" set-pipeline -p $pipeline -c ${opt_dir}/${pipeline}.yml)"
-    if [[ "$?" -ne 0 ]]
-    then
-      fatal "Could not set pipeline ${pipeline}: $result"
-    fi
+    [[ "$?" -eq 0 ]] || fatal "Could not set pipeline ${pipeline}: $result"
 
     local pause_cmd
     pipeline_state="$(cat "${opt_dir}/${pipeline}.state")"
@@ -487,10 +459,7 @@ cmd_restore() {
     if [[ -n "$pause_cmd" ]]
     then
       result="$(${HANGAR_DIR}/fly -t "$opt_target" $pause_cmd -p $pipeline)"
-      if [[ "$?" -ne 0 ]]
-      then
-        fatal "Could not pause pipeline ${pipeline}: $result"
-      fi
+      [[ "$?" -eq 0 ]] || fatal "Could not pause pipeline ${pipeline}: $result"
     fi
 
     if [[ -n "$opt_clean" ]]
@@ -560,9 +529,7 @@ main() {
     action=cmd_restore_all
     ;;
   esac
-  if [[ -z "${action}" ]]
-    bad_command ${cmd_name}
-  fi
+  [[ -n "${action}" ]] || bad_command ${cmd_name}
 
   parse_opts
   $action
