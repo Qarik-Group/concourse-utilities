@@ -1,14 +1,18 @@
 #!/bin/bash
+
+source /usr/share/bashdb/bashdb-trace
+
 VERSION=1.1.0
 
 USERNAME=$(whoami)
 CANON_REPO=https://github.com/starkandwayne/hangar
 HANGAR_DIR="${HOME}/.hangar"
+FLY_CMD="${HANGAR_DIR}/fly"
 
 # Options
 opt_target=${CONCOURSE_TARGET}
 opt_pause_after_restore='a'
-opt_dir="${HANGAR_DIR}/backups"
+opt_backup_dir="${HANGAR_DIR}/backups"
 opt_clean=""
 target_pipelines=()
 
@@ -22,7 +26,7 @@ get_pipelines() {
   local name
   local state
 
-  pipeline_info="$(${HANGAR_DIR}/fly -t $opt_target pipelines)"
+  pipeline_info="$(${FLY_CMD} -t $opt_target pipelines)"
   if [[ "$?" -ne 0 ]]
   then
     fatal \
@@ -69,25 +73,25 @@ get_backups() {
 
 pipeline_state() {
   name=$1
-  index="(echo ${pipelines[@]/${name}//} | cut -d/ -f1 | wc -w | tr -d ' ')"
+  index="$(echo ${pipelines[@]/${name}//} | cut -d/ -f1 | wc -w | tr -d ' ')"
   echo "${pipeline_states[$index]}"
 }
 
 pipeline_exists() {
   name=$1
-  index="(echo ${pipelines[@]/${name}//} | cut -d/ -f1 | wc -w | tr -d ' ')"
+  index="$(echo ${pipelines[@]/${name}//} | cut -d/ -f1 | wc -w | tr -d ' ')"
   [[ $index -lt ${#pipelines[@]} ]]
 }
 
 backup_state() {
   name=$1
-  index="(echo ${backups[@]/${name}//} | cut -d/ -f1 | wc -w | tr -d ' ')"
+  index="$(echo ${backups[@]/${name}//} | cut -d/ -f1 | wc -w | tr -d ' ')"
   echo "${backup_states[$index]}"
 }
 
 backup_exists() {
   name=$1
-  index="(echo ${backups[@]/${name}//} | cut -d/ -f1 | wc -w | tr -d ' ')"
+  index="$(echo ${backups[@]/${name}//} | cut -d/ -f1 | wc -w | tr -d ' ')"
   [[ $index -lt ${#backups[@]} ]]
 }
 
@@ -111,33 +115,59 @@ check_target() {
   [[ $? -eq 0 ]] || fatal "Cannot reach Concourse target at ${fly_url}"
 }
 
+check_backup_directory_empty() {
+  shopt -s nullglob
+  files=(${opt_backup_dir}/*.{yml,state})
+  [[ "${#files[@]}" -eq 0 ]] || fatal "Backup directory (${opt_backup_dir}) cannot contain any .yml or .state files"
+}
+
 need_dirs() {
   [[ -d "$HANGAR_DIR" ]] || mkdir -p "${HANGAR_DIR}"
+  [[ -n "$opt_backup_dir" ]] || fatal "No backup directory specified"
   mkdir -p -- "$opt_backup_dir"
 }
 
 need_fly() {
 
-  echo "Updating ${HANGAR_DIR}/fly to the matching version for the target"
+  echo "Updating ${FLY_CMD} to the matching version for the target"
   yaml="$(parse_yaml ~/.flyrc fly_)"
   fly_url="$(echo "$yaml" | grep fly_targets_${opt_target}_api | sed -E 's/^.*?="(.*)"$/\1/')"
   fly_token_type="$(echo "$yaml" | grep fly_targets_${opt_target}_token_type | sed -E 's/^.*?="(.*)"$/\1/')"
   fly_token="$(echo "$yaml" | grep fly_targets_${opt_target}_token_value | sed -E 's/^.*?="(.*)"$/\1/')"
 
-  if [[ "$fly_token_type" != "Bearer" ]]
+  fetch_manually=true
+  if [[ "$fly_token_type" == "Bearer" ]]
   then
-    echo "WARNING: Cannot manually update ${HANGAR_DIR}/fly -- please manually download it"
-    echo "Try to continue anyways? (y/N)"
-    read can_continue
-    [[ "$can_continue" == "y" ]] ||  exit 2
-  else
     set -e
-    curl "${fly_url}/api/v1/cli?arch=amd64&platform=linux" -o ${HANGAR_DIR}/fly --oauth2-bearer "$fly_token"
+    curl "${fly_url}/api/v1/cli?arch=amd64&platform=linux" -o ${FLY_CMD} -H "Authorization: Bearer $fly_token"
     set +e
-    chmod u+x  ${HANGAR_DIR}/fly
+
+    if [[ ! "$(file "${FLY_CMD}")" =~ ASCII\ text ]]
+    then
+      fetch_manually=false
+      chmod u+x  ${FLY_CMD}
+    fi
   fi
 
-  [[ -x  ${HANGAR_DIR}/fly ]] || fatal "ERROR: ${HANGAR_DIR}/fly not found or not executable -- cannot continue."
+  if [[ "$fetch_manually" == "true" ]]
+  then
+    echo "Could not fetch fly -- need to log in with HTTP Basic Auth"
+    read -p "username: " username
+    read -p "password: " -s password
+    auth="$username:$password"
+    curl "${fly_url}/api/v1/cli?arch=amd64&platform=linux" --basic --user $auth -o ${FLY_CMD}
+    if [[ "$(file "${FLY_CMD}")" =~ ASCII\ text ]]
+    then
+      rm ${FLY_CMD}
+      fatal "Could not log into Concourse to fetch fly!"
+    fi
+    echo ""
+    echo "Successfully fetched - Log into Concourse"
+    chmod u+x  ${FLY_CMD}
+    ${FLY_CMD} -t $opt_target login -k
+  fi
+
+  [[ -x  ${FLY_CMD} ]] || fatal "ERROR: ${FLY_CMD} not found or not executable -- cannot continue."
 }
 
 
@@ -154,7 +184,7 @@ parse_opts() {
       shift
       ;;
     (-p|--path)
-      opt_dir="$1"
+      opt_backup_dir="$1"
       shift
       ;;
     (*)
@@ -162,41 +192,41 @@ parse_opts() {
       offset=0
       if command -V $cmd_opt_parser | grep "is a function" 2>/dev/null 1>&2
       then
-        offset="$($cmd_opt_parser $arg $*)"
+        $cmd_opt_parser $arg $*
       fi
       [[ "$offset" -gt 0 ]] || fatal "Unknown option '$arg'"
       while (( offset = offset - 1 ))
       do
-        shift;;
+        shift
       done
       ;;
     esac
   done
 }
 
-cmd_backup_option_parser() {
+cmd_backup_opt_parser() {
   local arg
   arg=$1 ; shift
   case ${arg} in
     (-P|--pause)
       opt_pause_first=true
-      echo 1
+      offset=1
       ;;
     (-c|--clean)
       opt_clean=true
-      echo 1
+      offset=1
       ;;
     (-*)
-      echo 0
+      offset=0
       ;;
     (*)
       target_pipelines+=($arg)
-      echo 1
+      offset=1
       ;;
   esac
 }
 
-cmd_restore_option_parser() {
+cmd_restore_opt_parser() {
   local arg
   local opt
   arg=$1 ; shift
@@ -211,22 +241,22 @@ cmd_restore_option_parser() {
           fatal "Error: $arg expects (y)es, (n)o or (a)uto"
           ;;
       esac
-      echo 2
+      offset=2
       ;;
     (-c|--clean)
       opt_clean=true
-      echo 1
+      offset=1
       ;;
     (-missing)
       opt_restore_missing=true
-      echo 1
+      offset=1
       ;;
     (-*)
-      echo 0
+      offset=0
       ;;
     (*)
       target_pipelines+=($arg)
-      echo 1
+      offset=1
       ;;
   esac
 }
@@ -235,7 +265,7 @@ cmd_restore_option_parser() {
 # common functions used by other parts of hangar
 
 fatal() {
-  for msg in $@
+  for msg in "$@"
   do
     echo >&2 $msg
   done
@@ -351,8 +381,8 @@ cmd_clean() {
 
   for backup in ${backups[@]}
   do
-    rm $opt_dir/$backup.yml
-    rm $opt_dir/$backup.state
+    rm $opt_backup_dir/$backup.yml
+    rm $opt_backup_dir/$backup.state
   done
   backups=()
 }
@@ -364,7 +394,7 @@ cmd_backup() {
 
   need_dirs
   check_target
-  nead_fly
+  need_fly
 
   if [[ -n "$opt_clean" ]]
   then
@@ -378,6 +408,7 @@ cmd_backup() {
   then
     for pipeline in "${target_pipelines[@]}"
     do
+      _Dbg_debugger
       if ! pipeline_exists $pipeline
       then
         fatal "$pipeline does not exist on specified Concourse target"
@@ -391,19 +422,19 @@ cmd_backup() {
   do
     if [[ -n "$opt_pause_first" ]]
     then 
-      result="$(${HANGAR_DIR}/fly -t "$opt_target" pause-pipeline -p $pipeline)"
+      result="$(${FLY_CMD} -t "$opt_target" pause-pipeline -p $pipeline)"
       if [[ "$?" -ne 0 ]]
       then
         fatal "Could not pause pipeline ${pipeline}: $result"
       fi
     fi
-    result="$(${HANGAR_DIR}/fly -t "$opt_target" get-pipeline -p $pipeline)"
+    result="$(${FLY_CMD} -t "$opt_target" get-pipeline -p $pipeline)"
     if [[ "$?" -ne 0 ]]
     then
       fatal "Could not fetch pipeline ${pipeline}: $result"
     fi
-    echo result > ${opt_dir}/${pipeline}.yml
-    pipeline_state $pipeline > ${opt_dir}/${pipeline}.state
+    echo result > ${opt_backup_dir}/${pipeline}.yml
+    pipeline_state $pipeline > ${opt_backup_dir}/${pipeline}.state
   done
 }
 
@@ -414,7 +445,7 @@ cmd_restore() {
 
   need_dirs
   check_target
-  nead_fly
+  need_fly
 
   get_backups
   if [[ ${#target_pipelines[@]} -gt 0 ]]
@@ -424,6 +455,7 @@ cmd_restore() {
       backup_exists $pipeline || fatal "$pipeline does not exist on specified Concourse target"
     done
   elif [[ -n "$opt_restore_missing" ]]
+  then
     local missing_pipelines=()
     get_pipelines
     for pipeline in "${backups[@]}"
@@ -440,11 +472,11 @@ cmd_restore() {
 
   for pipeline in "${target_pipelines[@]}"
   do
-    result="$(${HANGAR_DIR}/fly -t "$opt_target" set-pipeline -p $pipeline -c ${opt_dir}/${pipeline}.yml)"
+    result="$(${FLY_CMD} -t "$opt_target" set-pipeline -p $pipeline -c ${opt_backup_dir}/${pipeline}.yml)"
     [[ "$?" -eq 0 ]] || fatal "Could not set pipeline ${pipeline}: $result"
 
     local pause_cmd
-    pipeline_state="$(cat "${opt_dir}/${pipeline}.state")"
+    pipeline_state="$(cat "${opt_backup_dir}/${pipeline}.state")"
     case ${opt_pause_after_restore/a/$pipeline_state} in
       (y|yes)
         pause_cmd="pp"
@@ -458,14 +490,14 @@ cmd_restore() {
     esac
     if [[ -n "$pause_cmd" ]]
     then
-      result="$(${HANGAR_DIR}/fly -t "$opt_target" $pause_cmd -p $pipeline)"
+      result="$(${FLY_CMD} -t "$opt_target" $pause_cmd -p $pipeline)"
       [[ "$?" -eq 0 ]] || fatal "Could not pause pipeline ${pipeline}: $result"
     fi
 
     if [[ -n "$opt_clean" ]]
     then
-      rm ${opt_dir}/${pipeline}.yml
-      rm ${opt_dir}/${pipeline}.state
+      rm ${opt_backup_dir}/${pipeline}.yml
+      rm ${opt_backup_dir}/${pipeline}.state
     fi
 
   done
@@ -518,7 +550,7 @@ main() {
     ;;
   (clean)
     # Delete all existing backups
-    action=cmd_backup
+    action=cmd_clean
     ;;
   (backup)
     # Backup the pipelines
@@ -531,7 +563,7 @@ main() {
   esac
   [[ -n "${action}" ]] || bad_command ${cmd_name}
 
-  parse_opts
+  parse_opts $@
   $action
 }
 
