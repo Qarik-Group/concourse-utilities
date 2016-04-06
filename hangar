@@ -1,7 +1,5 @@
 #!/bin/bash
 
-source /usr/share/bashdb/bashdb-trace
-
 VERSION=1.1.0
 
 USERNAME=$(whoami)
@@ -51,7 +49,7 @@ get_backups() {
   local name
   local state
 
-  pushd $opt_backup_dir
+  pushd $opt_backup_dir > /dev/null
   backup_files=(*.yml)
   backups=()
   backup_states=()
@@ -68,7 +66,7 @@ get_backups() {
     backups+=("$name")
     backup_states+=("$state")
   done
-  popd 
+  popd > /dev/null
 }
 
 pipeline_state() {
@@ -111,7 +109,7 @@ check_target() {
   yaml="$(parse_yaml ~/.flyrc fly_)"
   fly_url="$(echo "$yaml" | grep fly_targets_${opt_target}_api | sed -E 's/^.*?="(.*)"$/\1/')"
 
-  results="$(curl ${fly_url})"
+  results="$(curl -sS ${fly_url})"
   [[ $? -eq 0 ]] || fatal "Cannot reach Concourse target at ${fly_url}"
 }
 
@@ -129,7 +127,7 @@ need_dirs() {
 
 need_fly() {
 
-  echo "Updating ${FLY_CMD} to the matching version for the target"
+  echo "Ensuring ${FLY_CMD} to the matching version for the target"
   yaml="$(parse_yaml ~/.flyrc fly_)"
   fly_url="$(echo "$yaml" | grep fly_targets_${opt_target}_api | sed -E 's/^.*?="(.*)"$/\1/')"
   fly_token_type="$(echo "$yaml" | grep fly_targets_${opt_target}_token_type | sed -E 's/^.*?="(.*)"$/\1/')"
@@ -138,12 +136,12 @@ need_fly() {
   fetch_manually=true
   if [[ "$fly_token_type" == "Bearer" ]]
   then
-    set -e
-    curl "${fly_url}/api/v1/cli?arch=amd64&platform=linux" -o ${FLY_CMD} -H "Authorization: Bearer $fly_token"
-    set +e
+    curl -sS "${fly_url}/api/v1/cli?arch=amd64&platform=linux" -o ${FLY_CMD} -H "Authorization: Bearer $fly_token"
 
     if [[ ! "$(file "${FLY_CMD}")" =~ ASCII\ text ]]
     then
+      echo "Retrieved!"
+      echo ""
       fetch_manually=false
       chmod u+x  ${FLY_CMD}
     fi
@@ -155,7 +153,7 @@ need_fly() {
     read -p "username: " username
     read -p "password: " -s password
     auth="$username:$password"
-    curl "${fly_url}/api/v1/cli?arch=amd64&platform=linux" --basic --user $auth -o ${FLY_CMD}
+    curl -sS "${fly_url}/api/v1/cli?arch=amd64&platform=linux" --basic --user $auth -o ${FLY_CMD}
     if [[ "$(file "${FLY_CMD}")" =~ ASCII\ text ]]
     then
       rm ${FLY_CMD}
@@ -247,7 +245,7 @@ cmd_restore_opt_parser() {
       opt_clean=true
       offset=1
       ;;
-    (-missing)
+    (--missing)
       opt_restore_missing=true
       offset=1
       ;;
@@ -408,7 +406,6 @@ cmd_backup() {
   then
     for pipeline in "${target_pipelines[@]}"
     do
-      _Dbg_debugger
       if ! pipeline_exists $pipeline
       then
         fatal "$pipeline does not exist on specified Concourse target"
@@ -418,23 +415,34 @@ cmd_backup() {
     target_pipelines=("${pipelines[@]}")
   fi
 
+  echo "Backing up pipelines"
   for pipeline in "${target_pipelines[@]}"
   do
     if [[ -n "$opt_pause_first" ]]
-    then 
-      result="$(${FLY_CMD} -t "$opt_target" pause-pipeline -p $pipeline)"
-      if [[ "$?" -ne 0 ]]
+    then
+      if [[ "$(pipeline_state $pipeline)" == "yes" ]]
       then
-        fatal "Could not pause pipeline ${pipeline}: $result"
+        echo "  * ${pipeline} is already paused."
+      else
+        echo -n "  * Pausing ${pipeline} first..."
+        result="$(${FLY_CMD} -t "$opt_target" pause-pipeline -p $pipeline)"
+        if [[ "$?" -ne 0 ]]
+        then
+          fatal "Could not pause pipeline ${pipeline}: $result"
+        fi
+        echo 'done!'
       fi
     fi
+    echo -n "  * Fetching ${pipeline}..."
     result="$(${FLY_CMD} -t "$opt_target" get-pipeline -p $pipeline)"
     if [[ "$?" -ne 0 ]]
     then
       fatal "Could not fetch pipeline ${pipeline}: $result"
     fi
-    echo result > ${opt_backup_dir}/${pipeline}.yml
+    echo "$result" > ${opt_backup_dir}/${pipeline}.yml
     pipeline_state $pipeline > ${opt_backup_dir}/${pipeline}.state
+    echo 'done!'
+    echo ""
   done
 }
 
@@ -442,11 +450,13 @@ cmd_restore() {
 
   local pipeline
   local result
+  local desc
 
   need_dirs
   check_target
   need_fly
 
+  echo "Restoring backups to $opt_target"
   get_backups
   if [[ ${#target_pipelines[@]} -gt 0 ]]
   then
@@ -470,19 +480,29 @@ cmd_restore() {
     target_pipelines=("${backups[@]}")
   fi
 
+  if [[ "${#target_pipelines[@]}" -eq 0 ]]
+  then
+    echo "No pipelines to restore"
+    return
+  fi
+
   for pipeline in "${target_pipelines[@]}"
   do
-    result="$(${FLY_CMD} -t "$opt_target" set-pipeline -p $pipeline -c ${opt_backup_dir}/${pipeline}.yml)"
+    echo -n "  * Uploading ${pipeline}..."
+    result="$(${FLY_CMD} -t "$opt_target" set-pipeline -n -p $pipeline -c ${opt_backup_dir}/${pipeline}.yml)"
     [[ "$?" -eq 0 ]] || fatal "Could not set pipeline ${pipeline}: $result"
+    echo 'done!'
 
     local pause_cmd
     pipeline_state="$(cat "${opt_backup_dir}/${pipeline}.state")"
     case ${opt_pause_after_restore/a/$pipeline_state} in
       (y|yes)
         pause_cmd="pp"
+        desc="Pausing"
         ;;
       (n|no)
         pause_cmd="up"
+        desc="Unpausing"
         ;;
       (*)
         pause_cmd=""
@@ -490,16 +510,40 @@ cmd_restore() {
     esac
     if [[ -n "$pause_cmd" ]]
     then
+      echo -n "  * ${desc} ${pipeline}..."
       result="$(${FLY_CMD} -t "$opt_target" $pause_cmd -p $pipeline)"
-      [[ "$?" -eq 0 ]] || fatal "Could not pause pipeline ${pipeline}: $result"
+      [[ "$?" -eq 0 ]] || fatal "$desc pipeline ${pipeline} failed: $result"
+      echo 'done!'
     fi
 
     if [[ -n "$opt_clean" ]]
     then
+      echo "  * Removing backup"
       rm ${opt_backup_dir}/${pipeline}.yml
       rm ${opt_backup_dir}/${pipeline}.state
     fi
+    echo ""
 
+  done
+}
+
+cmd_inv() {
+
+  local pipeline
+  local result
+
+  need_dirs
+  check_target
+  need_fly
+
+  get_backups
+
+  echo "Paused  Name"
+  echo "------  --------------------------------------------------------------"
+  for pipeline in "${backups[@]}"
+  do
+    pipeline_state="$(cat "${opt_backup_dir}/${pipeline}.state")"
+    printf "%-6s  %s\n" $pipeline_state $pipeline
   done
 }
 
@@ -558,7 +602,11 @@ main() {
     ;;
   (restore)
     # Restore the pipelines
-    action=cmd_restore_all
+    action=cmd_restore
+    ;;
+  (inv|inventory)
+    # List the contents of the hanger
+    action=cmd_inv
     ;;
   esac
   [[ -n "${action}" ]] || bad_command ${cmd_name}
@@ -569,4 +617,5 @@ main() {
 
 main $@
 
+echo ""
 # fin
