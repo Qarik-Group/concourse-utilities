@@ -49,16 +49,19 @@ get_backups() {
   local name
   local state
 
-  pushd $opt_backup_dir > /dev/null
-  backup_files=(*.yml)
+  echo "backup dir: $opt_backup_dir"
+
+  shopt -s nullglob
+  backup_files=(${opt_backup_dir}/*.yml)
+  shopt -u nullglob
   backups=()
   backup_states=()
   for file in "${backup_files[@]}"
   do
-    name="$( echo "$file" | sed -e 's/\.yml$//' )"
-    if [[ -f "${name}.state" ]]
+    name="$( echo "$file" | sed -E 's#.*/([^/]*)\.yml$#\1#' )"
+    if [[ -f "${opt_backup_dir}/${name}.state" ]]
     then
-      state="$(cat ${name}.state)"
+      state="$(cat ${opt_backup_dir}/${name}.state)"
     else
       state="unknown"
     fi
@@ -66,7 +69,6 @@ get_backups() {
     backups+=("$name")
     backup_states+=("$state")
   done
-  popd > /dev/null
 }
 
 pipeline_state() {
@@ -159,9 +161,15 @@ need_fly() {
       rm ${FLY_CMD}
       fatal "Could not log into Concourse to fetch fly!"
     fi
-    echo ""
-    echo "Successfully fetched - Log into Concourse"
     chmod u+x  ${FLY_CMD}
+    echo ""
+    echo "Successfully fetched"
+  fi
+
+  test="$(${FLY_CMD} -t ${opt_target} workers 2>&1)"
+  if [[ "$test" =~ not\ authorized ]]
+  then
+    echo "Log into Concourse"
     ${FLY_CMD} -t $opt_target login -k
   fi
 
@@ -307,50 +315,67 @@ Common commands:
 
     hangar refresh             Restore pipelines
 
-    hangar contents            List the backed up pipelines
+    hangar inventory           List the backed up pipelines (inv for short)
 
     hangar help                Peruse the help!  Give it a topic argument, or the name
-                                of another command to get more detailed information.
-                                Documentation!
+                               of another command to get more detailed information.
+                               Documentation!
+
+Common options:
+
+    -t | --target <name>      Specify the target concourse.  By default, it will
+                              use the value in \$CONCOURSE_TARGET if available.
+
+    -p | --path <path>        Specify the backup path for storage or source for
+                              restoring.  By default, it is set to ~/.hangar/backups
 
 EOF
     exit 0
     ;;
   (clean)
     cat >&2 <<EOF
-USAGE: hangar new deployment NAME
-       hangar new site SITE
-       hangar new environment SITE ENVIRONMENT
+USAGE: hangar backup <options> <pipelines...>
 
-Creates new things, with all the right files in all the right places.
-
+Cleans out the backups from the backup directory
 
 EOF
     exit 0
     ;;
   (backup)
     cat >&2 <<EOF
-USAGE: hangar build
+USAGE: hangar backup <options> <pipelines...>
 
-Compiles all of the YAML templates down to a single BOSH manifest
-for the current environment.
+Retrieves the pipelines from concourse, and stores them in the backup directory,
+including the paused state of the backup.  If pipelines are specified, only those
+pipelines will be backed up.
 
+Options:
+  -P | --pause                Pause the pipeline to be backed up before backing it up
+
+  -c | --clean                Clean the backup directory before fetching the backups.
+                              NOTE:  The backup directory has to be empty before
+                                     the backups are taken.
 EOF
     exit 0
     ;;
   (restore)
     cat >&2 <<EOF
-USAGE: hangar refresh [(global|site|all|makefile|readme)]
+USAGE: hangar restore <options> <pipelines...>
 
-Copies current definitions of the global templates and/or the
-current site into the current environment.  By default, copies both.
+Restores the pipelines from the backup directory to concourse.  If pipelines are
+specified, only those pipelines will be restored.
 
-The argument 'makefile' only rebuilds the Makefile for an environment,
-which can be useful to bring old deployments in-line with newer versions
-of hangar.
+Options:
+  --missing                   Only restore pipelines that aren't present on the
+                              target concourse.
 
-Similarly, 'readme' only recreates the various README files for the top-level,
-the global/ directories, and all sites and environments.
+  -c | --clean                Remove the backups after restoring them.
+
+  -P | --pause (yes|no)       Pause or unpause the restored pipeline after restoring
+                              it.  'yes' and 'no' can be abbreviated as 'y' and 'n'
+                              respectively.  By default, the pipelines will be
+                              paused only if they were paused prior to being backed
+                              up, otherwise they will be unpaused.
 
 EOF
     exit 0
@@ -538,12 +563,13 @@ cmd_inv() {
 
   get_backups
 
-  echo "Paused  Name"
-  echo "------  --------------------------------------------------------------"
+  echo "Date              Paused  Name"
+  echo "----------------  ------  --------------------------------------------------------------"
   for pipeline in "${backups[@]}"
   do
+    ts="$(date -d "$(stat -c "%z" ${opt_backup_dir}/${pipeline}.yml)" +"%Y-%m-%d@%H:%M")"
     pipeline_state="$(cat "${opt_backup_dir}/${pipeline}.state")"
-    printf "%-6s  %s\n" $pipeline_state $pipeline
+    printf "%-18s%-8s%s\n" "$ts" "$pipeline_state" "$pipeline"
   done
 }
 
