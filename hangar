@@ -10,7 +10,7 @@ FLY_CMD="${HANGAR_DIR}/fly"
 # Options
 opt_target=${CONCOURSE_TARGET}
 opt_pause_after_restore='a'
-opt_backup_dir="${HANGAR_DIR}/backups"
+opt_backup_dir="${HANGAR_DIR}/backups/(target)"
 opt_clean=""
 target_pipelines=()
 
@@ -49,19 +49,20 @@ get_backups() {
   local name
   local state
 
-  echo "backup dir: $opt_backup_dir"
+  local backup_dir="$(get_backup_dir)"
+  echo "backup dir: $backup_dir"
 
   shopt -s nullglob
-  backup_files=(${opt_backup_dir}/*.yml)
+  backup_files=(${backup_dir}/*.yml)
   shopt -u nullglob
   backups=()
   backup_states=()
   for file in "${backup_files[@]}"
   do
     name="$( echo "$file" | sed -E 's#.*/([^/]*)\.yml$#\1#' )"
-    if [[ -f "${opt_backup_dir}/${name}.state" ]]
+    if [[ -f "${backup_dir}/${name}.state" ]]
     then
-      state="$(cat ${opt_backup_dir}/${name}.state)"
+      state="$(cat ${backup_dir}/${name}.state)"
     else
       state="unknown"
     fi
@@ -116,15 +117,31 @@ check_target() {
 }
 
 check_backup_directory_empty() {
+  local backup_dir="$(get_backup_dir)"
   shopt -s nullglob
-  files=(${opt_backup_dir}/*.{yml,state})
-  [[ "${#files[@]}" -eq 0 ]] || fatal "Backup directory (${opt_backup_dir}) cannot contain any .yml or .state files"
+  files=(${backup_dir}/*.{yml,state})
+  [[ "${#files[@]}" -eq 0 ]] || fatal "Backup directory (${backup_dir}) cannot contain any .yml or .state files"
+}
+
+get_backup_dir() {
+  if [[ "$opt_backup_dir" == *"(target)"* ]]
+  then
+    if [[ -z ${target} ]]
+    then
+      fatal "No target specified, but backup directory uses (target) placeholder"
+    fi
+    local target=$(echo $opt_target | sed -e "s#/#\\/#g")
+    echo "${opt_backup_dir}" | sed -e "s/(target)/${target}/"
+  else
+    echo ${opt_backup_dir}
+  fi
 }
 
 need_dirs() {
+  local backup_dir="$(get_backup_dir)"
   [[ -d "$HANGAR_DIR" ]] || mkdir -p "${HANGAR_DIR}"
-  [[ -n "$opt_backup_dir" ]] || fatal "No backup directory specified"
-  mkdir -p -- "$opt_backup_dir"
+  [[ -n "$backup_dir" ]] || fatal "No backup directory specified"
+  mkdir -p -- "$backup_dir"
 }
 
 need_fly() {
@@ -194,6 +211,11 @@ parse_opts() {
       shift
       ;;
     (*)
+      if [[ $INLINE_PARSING == 'true' ]]
+      then
+        NEW_ARGS=("$arg" "$@")
+        return
+      fi
       cmd_opt_parser="${action}_opt_parser"
       offset=0
       if command -V $cmd_opt_parser | grep "is a function" 2>/dev/null 1>&2
@@ -204,6 +226,7 @@ parse_opts() {
       while (( offset = offset - 1 ))
       do
         shift
+        ;;
       done
       ;;
     esac
@@ -313,7 +336,9 @@ Common commands:
 
     hangar backup              Backup all pipelines
 
-    hangar refresh             Restore pipelines
+    hangar restore             Restore pipelines
+
+    hangar restore-state       Restore the paused state of existing pipelines
 
     hangar inventory           List the backed up pipelines (inv for short)
 
@@ -402,10 +427,11 @@ cmd_clean() {
   need_dirs
   get_backups
 
+  local backup_dir="$(get_backup_dir)"
   for backup in ${backups[@]}
   do
-    rm $opt_backup_dir/$backup.yml
-    rm $opt_backup_dir/$backup.state
+    rm "$backup_dir/$backup.yml"
+    rm "$backup_dir/$backup.state"
   done
   backups=()
 }
@@ -415,8 +441,8 @@ cmd_backup() {
   local pipeline
   local result
 
-  need_dirs
   check_target
+  need_dirs
   need_fly
 
   if [[ -n "$opt_clean" ]]
@@ -424,6 +450,7 @@ cmd_backup() {
     cmd_clean
   fi
 
+  local backup_dir="$(get_backup_dir)"
   check_backup_directory_empty
 
   get_pipelines
@@ -464,8 +491,8 @@ cmd_backup() {
     then
       fatal "Could not fetch pipeline ${pipeline}: $result"
     fi
-    echo "$result" > ${opt_backup_dir}/${pipeline}.yml
-    pipeline_state $pipeline > ${opt_backup_dir}/${pipeline}.state
+    echo "$result" > "${backup_dir}/${pipeline}.yml"
+    pipeline_state $pipeline > "${backup_dir}/${pipeline}.state"
     echo 'done!'
     echo ""
   done
@@ -477,10 +504,11 @@ cmd_restore() {
   local result
   local desc
 
-  need_dirs
   check_target
+  need_dirs
   need_fly
 
+  local backup_dir="$(get_backup_dir)"
   echo "Restoring backups to $opt_target"
   get_backups
   if [[ ${#target_pipelines[@]} -gt 0 ]]
@@ -514,12 +542,13 @@ cmd_restore() {
   for pipeline in "${target_pipelines[@]}"
   do
     echo -n "  * Uploading ${pipeline}..."
-    result="$(${FLY_CMD} -t "$opt_target" set-pipeline -n -p $pipeline -c ${opt_backup_dir}/${pipeline}.yml)"
+    result="$(${FLY_CMD} -t "$opt_target" set-pipeline -n -p $pipeline -c "${backup_dir}/${pipeline}.yml")"
     [[ "$?" -eq 0 ]] || fatal "Could not set pipeline ${pipeline}: $result"
     echo 'done!'
 
     local pause_cmd
-    pipeline_state="$(cat "${opt_backup_dir}/${pipeline}.state")"
+    # TODO: why aren't we using $(backup_state $pipeline)
+    pipeline_state="$(cat "${backup_dir}/${pipeline}.state")"
     case ${opt_pause_after_restore/a/$pipeline_state} in
       (y|yes)
         pause_cmd="pp"
@@ -544,8 +573,8 @@ cmd_restore() {
     if [[ -n "$opt_clean" ]]
     then
       echo "  * Removing backup"
-      rm ${opt_backup_dir}/${pipeline}.yml
-      rm ${opt_backup_dir}/${pipeline}.state
+      rm "${backup_dir}/${pipeline}.yml"
+      rm "${backup_dir}/${pipeline}.state"
     fi
     echo ""
 
@@ -557,19 +586,75 @@ cmd_inv() {
   local pipeline
   local result
 
-  need_dirs
   check_target
+  need_dirs
   need_fly
 
+  local backup_dir="$(get_backup_dir)"
   get_backups
 
   echo "Date              Paused  Name"
   echo "----------------  ------  --------------------------------------------------------------"
   for pipeline in "${backups[@]}"
   do
-    ts="$(date -d "$(stat -c "%z" ${opt_backup_dir}/${pipeline}.yml)" +"%Y-%m-%d@%H:%M")"
-    pipeline_state="$(cat "${opt_backup_dir}/${pipeline}.state")"
+    ts="$(date -d "$(stat -c "%z" ${backup_dir}/${pipeline}.yml)" +"%Y-%m-%d@%H:%M")"
+    # TODO: why aren't we using $(backup_state $pipeline)
+    pipeline_state="$(cat "${backup_dir}/${pipeline}.state")"
     printf "%-18s%-8s%s\n" "$ts" "$pipeline_state" "$pipeline"
+  done
+}
+
+cmd_restore_state() {
+
+  local pipeline
+  local result
+
+  check_target
+  need_dirs
+  need_fly
+
+  local backup_dir="$(get_backup_dir)"
+  get_backups
+  if [[ ${#target_pipelines[@]} -gt 0 ]]
+  then
+    for pipeline in "${target_pipelines[@]}"
+    do
+      backup_exists $pipeline || fatal "$pipeline does not exist on specified Concourse target"
+    done
+  else
+    local present_pipelines=()
+    get_pipelines
+    for pipeline in "${backups[@]}"
+    do
+      if ! pipeline_exists $pipeline
+      then
+        present_pipelines+=($pipeline)
+      else
+        echo "WARNING: $pipeline was not found on specified Concourse target"
+      fi
+    done
+    target_pipelines=("${present_pipelines[@]}")
+  fi
+
+  for pipeline in "${target_pipelines[@]}"
+  do
+    local pause_cmd
+    # TODO: why aren't we using $(backup_state $pipeline)
+    pipeline_state="$(cat "${backup_dir}/${pipeline}.state")"
+    case ${pipeline_state} in
+      (y|yes)
+        pause_cmd="pp"
+        ;;
+      (n|no)
+        pause_cmd="up"
+        ;;
+      (*)
+        echo "WARNING: $pipeline state of ${pipeline_state} is not valid: expecting yes or no -- cannot restore"
+        continue
+        ;;
+    esac
+    result="$(${HANGAR_DIR}/fly -t "$opt_target" $pause_cmd -p $pipeline)"
+    [[ "$?" -eq 0 ]] || echo "Could not restore state of pipeline ${pipeline}: $result"
   done
 }
 
@@ -585,6 +670,7 @@ Try one of these:
    hangar clean
    hangar backup
    hangar restore
+   hangar restore-state
 
 EOF
   exit 1
@@ -602,46 +688,64 @@ checksum() {
 # multi-call interface
 
 main() {
-  local cmd_name=${1:-help} ; shift
   action=''
 
-  case ${cmd_name} in
-  (ping)
-    exit 0
-    ;;
-  (version|-v|--version)
-    s=$(cat ${BASH_SOURCE[0]} | checksum)
-    echo "hangar v${VERSION} (${s:0:12})"
-    exit 0
-    ;;
-  (help|-h|--help|-?)
-    cmd_help $*
-    exit 0
-    ;;
-  (clean)
-    # Delete all existing backups
-    action=cmd_clean
-    ;;
-  (backup)
-    # Backup the pipelines
-    action=cmd_backup
-    ;;
-  (restore)
-    # Restore the pipelines
-    action=cmd_restore
-    ;;
-  (inv|inventory)
-    # List the contents of the hanger
-    action=cmd_inv
-    ;;
-  esac
-  [[ -n "${action}" ]] || bad_command ${cmd_name}
+  while [[ action='' ]]
+  do
+    local cmd_name=${1:-help} ; shift
+    case ${cmd_name} in
+    (ping)
+      exit 0
+      ;;
+    (version|-v|--version)
+      s=$(cat ${BASH_SOURCE[0]} | checksum)
+      echo "hangar v${VERSION} (${s:0:12})"
+      exit 0
+      ;;
+    (help|-h|--help|-?)
+      cmd_help $*
+      exit 0
+      ;;
+    (-t|-p)
+      # Common options before commmand
+      INLINE_PARSING=true
+      set -- "$arg" "$@"
+      parse_opts "$@"
+      set -- "$NEW_ARGS"
+      INLINE_PARSING=false
+      main "$@"
+      ;;
 
-  parse_opts $@
+    (clean)
+      # Delete all existing backups
+      action=cmd_clean
+      ;;
+    (backup)
+      # Backup the pipelines
+      action=cmd_backup
+      ;;
+    (restore)
+      # Restore the pipelines
+      action=cmd_restore
+      ;;
+    (restore-state)
+      # Restore the paused state of existing pipelines
+      action=cmd_restore_state
+      ;;
+    (inv|inventory)
+      # List the contents of the hanger
+      action=cmd_inv
+      ;;
+    (*)
+      bad_command $cmd_name
+    esac
+  done
+
+  parse_opts "$@"
   $action
 }
 
-main $@
+main "$@"
 
 echo ""
 # fin
