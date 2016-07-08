@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VERSION=1.1.0
+VERSION=1.2.0
 
 USERNAME=$(whoami)
 CANON_REPO=https://github.com/starkandwayne/hangar
@@ -359,7 +359,8 @@ Common options:
                               use the value in \$CONCOURSE_TARGET if available.
 
     -p | --path <path>        Specify the backup path for storage or source for
-                              restoring.  By default, it is set to ~/.hangar/backups
+                              restoring.  By default, it is set to
+                              ~/.hangar/backups/<target>
 
 EOF
     exit 0
@@ -681,6 +682,7 @@ Try one of these:
    hangar backup
    hangar restore
    hangar restore-state
+   hangar inv[entory]
 
 EOF
   exit 1
