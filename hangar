@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VERSION=1.2.0
+VERSION=1.3.0
 
 USERNAME=$(whoami)
 CANON_REPO=https://github.com/starkandwayne/hangar
@@ -349,6 +349,10 @@ Common commands:
 
     hangar inventory           List the backed up pipelines (inv for short)
 
+    hangar targets             List the known targets, including the URL, if it's
+                               the default target, and when last backed up to the
+                               default backup directory.
+
     hangar help                Peruse the help!  Give it a topic argument, or the name
                                of another command to get more detailed information.
                                Documentation!
@@ -522,7 +526,7 @@ cmd_restore() {
   then
     for pipeline in "${target_pipelines[@]}"
     do
-      backup_exists $pipeline || fatal "$pipeline does not exist on specified Concourse target"
+      backup_exists $pipeline || fatal "No backup found for pipeline $pipeline in $backup_dir"
     done
   elif [[ -n "$opt_restore_missing" ]]
   then
@@ -588,34 +592,6 @@ cmd_restore() {
   done
 }
 
-cmd_inv() {
-
-  local pipeline
-  local result
-
-  check_target
-  need_dirs
-
-  get_backups
-
-  local on_mac=no; [[ "$(uname -s)" == "Darwin" ]] && on_mac=yes
-
-  echo "Date              Paused  Name"
-  echo "----------------  ------  --------------------------------------------------------------"
-  for pipeline in "${backups[@]}"
-  do
-    if [[ ${on_mac} ==  "yes" ]]
-    then
-      ts="$(date -j "$(stat -f "%Sa" -t '%m%d%H%M%Y.%S' ~/.hangar/backups/sw/vault-boshrelease.yml)" +"%Y-%m-%d@%H:%M")"
-    else
-      ts="$(date -d "$(stat -c "%z" ${backup_dir}/${pipeline}.yml)" +"%Y-%m-%d@%H:%M")"
-    fi
-    # TODO: why aren't we using $(backup_state $pipeline)
-    pipeline_state="$(cat "${backup_dir}/${pipeline}.state")"
-    printf "%-18s%-8s%s\n" "$ts" "$pipeline_state" "$pipeline"
-  done
-}
-
 cmd_restore_state() {
 
   local pipeline
@@ -630,18 +606,18 @@ cmd_restore_state() {
   then
     for pipeline in "${target_pipelines[@]}"
     do
-      backup_exists $pipeline || fatal "$pipeline does not exist on specified Concourse target"
+      backup_exists $pipeline || fatal "No backup found for pipeline $pipeline in $backup_dir"
     done
   else
     local present_pipelines=()
     get_pipelines
     for pipeline in "${backups[@]}"
     do
-      if ! pipeline_exists $pipeline
+      if pipeline_exists $pipeline
       then
         present_pipelines+=($pipeline)
       else
-        echo "WARNING: $pipeline was not found on specified Concourse target"
+        echo " ! WARNING: Pipeline $pipeline was not found on specified Concourse target"
       fi
     done
     target_pipelines=("${present_pipelines[@]}")
@@ -655,18 +631,78 @@ cmd_restore_state() {
     case ${pipeline_state} in
       (y|yes)
         pause_cmd="pp"
+        state_action=" -   Pausing"
         ;;
       (n|no)
         pause_cmd="up"
+        state_action=" - Unpausing"
         ;;
       (*)
-        echo "WARNING: $pipeline state of ${pipeline_state} is not valid: expecting yes or no -- cannot restore"
+        echo " ! WARNING: $pipeline state of ${pipeline_state} is not valid: expecting yes or no -- cannot restore"
         continue
         ;;
     esac
     result="$(${HANGAR_DIR}/fly -t "$opt_target" $pause_cmd -p $pipeline)"
-    [[ "$?" -eq 0 ]] || echo "Could not restore state of pipeline ${pipeline}: $result"
+    echo "$state_action pipeline $pipeline"
+    [[ "$?" -eq 0 ]] || echo " ! Could not restore state of pipeline ${pipeline}: $result"
   done
+}
+
+cmd_inv() {
+
+  local pipeline
+  local result
+
+  check_target
+  need_dirs
+
+  get_backups
+
+  local on_mac=no; [[ "$(uname -s)" == "Darwin" ]] && on_mac=yes
+
+  echo "Date                Paused  Name"
+  echo "------------------  ------  --------------------------------------------------------------"
+  for pipeline in "${backups[@]}"
+  do
+    if [[ ${on_mac} ==  "yes" ]]
+    then
+      ts="$(stat -f "%Sa" -t '%Y-%m-%d@%H:%M:%S' ~/.hangar/backups/sw/vault-boshrelease.yml)"
+    else
+      ts="$(date -d "$(stat -c "%z" ${backup_dir}/${pipeline}.yml)" +"%Y-%m-%d@%H:%M:%S")"
+    fi
+    # TODO: why aren't we using $(backup_state $pipeline)
+    pipeline_state="$(cat "${backup_dir}/${pipeline}.state")"
+    printf "%-18s%-8s%s\n" "$ts" "$pipeline_state" "$pipeline"
+  done
+}
+
+cmd_targets() {
+
+  local backup_dir
+  local latest_file
+  local backup_date
+
+  echo Known Targets:
+  echo --------------
+  while read -r target url || [[ -n $target ]]
+  do
+    default=""
+    [[ "$CONCOURSE_TARGET" == "$target" ]] && default=" (default)"
+    echo ""
+    echo "$target$default"
+    echo "  URL: $url"
+    opt_target="$target"
+    backup_dir=$(get_backup_dir)
+    if [[ -d $backup_dir ]]
+    then
+      latest_file=$(ls -1tr $backup_dir | tail -n1)
+      if [[ -f "${backup_dir}/${latest_file}" ]]
+      then
+        backup_date=$(stat -f "%Sc" -t '%Y-%m-%d@%H:%M' "${backup_dir}/${latest_file}")
+        echo "  Last backed up to $backup_dir on $backup_date"
+      fi
+    fi
+  done < <(parse_yaml ~/.flyrc fly_ | grep 'fly_targets_.*_api=' | sed -E 's/^fly_targets_(.*)_api="(.*)"$/\1 \2/')
 }
 
 bad_command() {
@@ -683,6 +719,7 @@ Try one of these:
    hangar restore
    hangar restore-state
    hangar inv[entory]
+   hangar targets
 
 EOF
   exit 1
@@ -745,6 +782,10 @@ main() {
     (inv|inventory)
       # List the contents of the hanger
       action=cmd_inv
+      ;;
+    (targets)
+      # List available/default targets
+      action=cmd_targets
       ;;
     (*)
       bad_command $cmd_name
