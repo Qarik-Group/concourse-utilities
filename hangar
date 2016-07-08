@@ -49,8 +49,8 @@ get_backups() {
   local name
   local state
 
-  local backup_dir="$(get_backup_dir)"
-  echo "backup dir: $backup_dir"
+  echo "Using backup directory '$backup_dir'"
+  echo
 
   shopt -s nullglob
   backup_files=(${backup_dir}/*.yml)
@@ -110,14 +110,16 @@ check_target() {
   [[ -n "$opt_target" ]] || fatal "No target specified.  Please set in \$CONCOURSE_TARGET or use the -t|--target option"
 
   yaml="$(parse_yaml ~/.flyrc fly_)"
-  fly_url="$(echo "$yaml" | grep fly_targets_${opt_target}_api | sed -E 's/^.*?="(.*)"$/\1/')"
+  fly_url="$(echo "$yaml" | grep fly_targets_${opt_target}_api | sed -E 's/^fly_[^=]*="(.*)"$/\1/')"
+  fly_insecure="$(echo "$yaml" | grep fly_targets_${opt_target}_insecure | sed -E 's/^fly_[^=]*="(.*)"$/\1/')"
 
-  results="$(curl -sS ${fly_url})"
+  local insecure_opt='' && [[ $fly_insecure == 'true' ]] && insecure_opt='-k'
+
+  results="$(curl -sS $insecure_opt ${fly_url})"
   [[ $? -eq 0 ]] || fatal "Cannot reach Concourse target at ${fly_url}"
 }
 
 check_backup_directory_empty() {
-  local backup_dir="$(get_backup_dir)"
   shopt -s nullglob
   files=(${backup_dir}/*.{yml,state})
   [[ "${#files[@]}" -eq 0 ]] || fatal "Backup directory (${backup_dir}) cannot contain any .yml or .state files"
@@ -126,7 +128,7 @@ check_backup_directory_empty() {
 get_backup_dir() {
   if [[ "$opt_backup_dir" == *"(target)"* ]]
   then
-    if [[ -z ${target} ]]
+    if [[ -z ${opt_target} ]]
     then
       fatal "No target specified, but backup directory uses (target) placeholder"
     fi
@@ -138,7 +140,7 @@ get_backup_dir() {
 }
 
 need_dirs() {
-  local backup_dir="$(get_backup_dir)"
+  backup_dir="$(get_backup_dir)" || exit 1
   [[ -d "$HANGAR_DIR" ]] || mkdir -p "${HANGAR_DIR}"
   [[ -n "$backup_dir" ]] || fatal "No backup directory specified"
   mkdir -p -- "$backup_dir"
@@ -148,14 +150,20 @@ need_fly() {
 
   echo "Ensuring ${FLY_CMD} to the matching version for the target"
   yaml="$(parse_yaml ~/.flyrc fly_)"
-  fly_url="$(echo "$yaml" | grep fly_targets_${opt_target}_api | sed -E 's/^.*?="(.*)"$/\1/')"
-  fly_token_type="$(echo "$yaml" | grep fly_targets_${opt_target}_token_type | sed -E 's/^.*?="(.*)"$/\1/')"
-  fly_token="$(echo "$yaml" | grep fly_targets_${opt_target}_token_value | sed -E 's/^.*?="(.*)"$/\1/')"
+  fly_url="$(echo "$yaml" | grep fly_targets_${opt_target}_api | sed -E 's/^fly_[^=]*="(.*)"$/\1/')"
+  fly_token_type="$(echo "$yaml" | grep fly_targets_${opt_target}_token_type | sed -E 's/^fly_[^=]*="(.*)"$/\1/')"
+  fly_token="$(echo "$yaml" | grep fly_targets_${opt_target}_token_value | sed -E 's/^fly_[^=]*="(.*)"$/\1/')"
+  fly_insecure="$(echo "$yaml" | grep fly_targets_${opt_target}_insecure | sed -E 's/^fly_[^=]*="(.*)"$/\1/')"
 
   fetch_manually=true
+
+  # TODO: ask the api the version of concourse, then check for ~/.hangar/fly_<version> -- if there, use that; if not, download it
+
+  local insecure_opt=''; [[ $fly_insecure == 'true' ]] && insecure_opt='-k'
+  local platform=$(uname -s | tr A-Z a-z)
   if [[ "$fly_token_type" == "Bearer" ]]
   then
-    curl -sS "${fly_url}/api/v1/cli?arch=amd64&platform=linux" -o ${FLY_CMD} -H "Authorization: Bearer $fly_token"
+    curl -sS ${insecure_opt} "${fly_url}/api/v1/cli?arch=amd64&platform=${platform}" -o ${FLY_CMD} -H "Authorization: Bearer $fly_token"
 
     if [[ ! "$(file "${FLY_CMD}")" =~ ASCII\ text ]]
     then
@@ -172,7 +180,7 @@ need_fly() {
     read -p "username: " username
     read -p "password: " -s password
     auth="$username:$password"
-    curl -sS "${fly_url}/api/v1/cli?arch=amd64&platform=linux" --basic --user $auth -o ${FLY_CMD}
+    curl -sS ${insecure_opt} "${fly_url}/api/v1/cli?arch=amd64&platform=${platform}" --basic --user $auth -o ${FLY_CMD}
     if [[ "$(file "${FLY_CMD}")" =~ ASCII\ text ]]
     then
       rm ${FLY_CMD}
@@ -187,7 +195,7 @@ need_fly() {
   if [[ "$test" =~ not\ authorized ]]
   then
     echo "Log into Concourse"
-    ${FLY_CMD} -t $opt_target login -k
+    ${FLY_CMD} -t $opt_target login $insecure_opt
   fi
 
   [[ -x  ${FLY_CMD} ]] || fatal "ERROR: ${FLY_CMD} not found or not executable -- cannot continue."
@@ -226,7 +234,6 @@ parse_opts() {
       while (( offset = offset - 1 ))
       do
         shift
-        ;;
       done
       ;;
     esac
@@ -424,6 +431,7 @@ cmd_clean() {
 
   local backup
 
+  check_target
   need_dirs
   get_backups
 
@@ -450,7 +458,6 @@ cmd_backup() {
     cmd_clean
   fi
 
-  local backup_dir="$(get_backup_dir)"
   check_backup_directory_empty
 
   get_pipelines
@@ -508,9 +515,8 @@ cmd_restore() {
   need_dirs
   need_fly
 
-  local backup_dir="$(get_backup_dir)"
   echo "Restoring backups to $opt_target"
-  get_backups
+ get_backups
   if [[ ${#target_pipelines[@]} -gt 0 ]]
   then
     for pipeline in "${target_pipelines[@]}"
@@ -588,16 +594,21 @@ cmd_inv() {
 
   check_target
   need_dirs
-  need_fly
 
-  local backup_dir="$(get_backup_dir)"
   get_backups
+
+  local on_mac=no; [[ "$(uname -s)" == "Darwin" ]] && on_mac=yes
 
   echo "Date              Paused  Name"
   echo "----------------  ------  --------------------------------------------------------------"
   for pipeline in "${backups[@]}"
   do
-    ts="$(date -d "$(stat -c "%z" ${backup_dir}/${pipeline}.yml)" +"%Y-%m-%d@%H:%M")"
+    if [[ ${on_mac} ==  "yes" ]]
+    then
+      ts="$(date -j "$(stat -f "%Sa" -t '%m%d%H%M%Y.%S' ~/.hangar/backups/sw/vault-boshrelease.yml)" +"%Y-%m-%d@%H:%M")"
+    else
+      ts="$(date -d "$(stat -c "%z" ${backup_dir}/${pipeline}.yml)" +"%Y-%m-%d@%H:%M")"
+    fi
     # TODO: why aren't we using $(backup_state $pipeline)
     pipeline_state="$(cat "${backup_dir}/${pipeline}.state")"
     printf "%-18s%-8s%s\n" "$ts" "$pipeline_state" "$pipeline"
@@ -613,7 +624,6 @@ cmd_restore_state() {
   need_dirs
   need_fly
 
-  local backup_dir="$(get_backup_dir)"
   get_backups
   if [[ ${#target_pipelines[@]} -gt 0 ]]
   then
@@ -690,10 +700,10 @@ checksum() {
 main() {
   action=''
 
-  while [[ action='' ]]
+  while [[ -z ${action} ]]
   do
     local cmd_name=${1:-help} ; shift
-    case ${cmd_name} in
+    case "${cmd_name}" in
     (ping)
       exit 0
       ;;
@@ -702,20 +712,18 @@ main() {
       echo "hangar v${VERSION} (${s:0:12})"
       exit 0
       ;;
-    (help|-h|--help|-?)
+    (help|-h|--help|-\?)
       cmd_help $*
       exit 0
       ;;
     (-t|-p)
       # Common options before commmand
       INLINE_PARSING=true
-      set -- "$arg" "$@"
+      set -- "$cmd_name" "$@"
       parse_opts "$@"
       set -- "$NEW_ARGS"
       INLINE_PARSING=false
-      main "$@"
       ;;
-
     (clean)
       # Delete all existing backups
       action=cmd_clean
