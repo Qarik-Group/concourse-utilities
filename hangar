@@ -133,7 +133,7 @@ fly_curl() {
 check_target() {
   [[ -n "$opt_target" ]] || fatal "No target specified.  Please set in \$CONCOURSE_TARGET or use the -t|--target option"
 
-  fly_curl "" || fatal "Cannot reach Concourse target at ${fly_url}" 
+  fly_curl "" >/dev/null || fatal "Cannot reach Concourse target at ${fly_url}" 
 }
 
 check_backup_directory_empty() {
