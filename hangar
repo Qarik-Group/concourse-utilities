@@ -106,17 +106,34 @@ need_command() {
   [[ -x "$(command -v $cmd)" ]] || fatal "${cmd} is not installed."
 }
 
+
+# First arg is path. Don't put the scheme://hostname:port in
+# Second arg is the output path
+# Third arg is basic auth params "username:password"
+fly_curl() {
+  local fly_url fly_insecure fly_ca_cert insecure_opt output_opt basic_auth_opt
+  fly_url="$(flyrc ".targets.${opt_target}.api")${1}"
+  fly_insecure="$(flyrc ".targets.${opt_target}.insecure")"
+  fly_token="$(flyrc ".targets.${opt_target}.token.value")"
+  fly_ca_cert="$(flyrc ".targets.${opt_target}.ca_cert")"
+  [[ "$fly_insecure" == 'true' ]] && insecure_opt='-k' 
+  [[ -n $2 ]] && output_opt="-o ${2}"
+  [[ -n $3 ]] && basic_auth_opt="--basic --user \"${3}\""
+  if [[ -n $fly_ca_cert ]] ; then 
+    curl -sS ${insecure_opt} ${output_opt} ${basic_auth_opt} -H "Authorization: Bearer $fly_token" --cacert <(cat <<<"${fly_ca_cert}") "${fly_url}"
+    rc=$?
+    return $rc
+  else
+    curl -sS ${insecure_opt} ${output_opt} ${basic_auth_opt} -H "Authorization: Bearer $fly_token" "${fly_url}"
+    rc=$?
+    return $rc
+  fi
+}
+
 check_target() {
   [[ -n "$opt_target" ]] || fatal "No target specified.  Please set in \$CONCOURSE_TARGET or use the -t|--target option"
 
-  yaml="$(parse_yaml ~/.flyrc fly_)"
-  fly_url="$(echo "$yaml" | grep fly_targets_${opt_target}_api | sed -E 's/^fly_[^=]*="(.*)"$/\1/')"
-  fly_insecure="$(echo "$yaml" | grep fly_targets_${opt_target}_insecure | sed -E 's/^fly_[^=]*="(.*)"$/\1/')"
-
-  local insecure_opt='' && [[ $fly_insecure == 'true' ]] && insecure_opt='-k'
-
-  results="$(curl -sS $insecure_opt ${fly_url})"
-  [[ $? -eq 0 ]] || fatal "Cannot reach Concourse target at ${fly_url}"
+  fly_curl "" || fatal "Cannot reach Concourse target at ${fly_url}" 
 }
 
 check_backup_directory_empty() {
@@ -149,38 +166,21 @@ need_dirs() {
 need_fly() {
 
   echo "Ensuring ${FLY_CMD} to the matching version for the target"
-  yaml="$(parse_yaml ~/.flyrc fly_)"
-  fly_url="$(echo "$yaml" | grep fly_targets_${opt_target}_api | sed -E 's/^fly_[^=]*="(.*)"$/\1/')"
-  fly_token_type="$(echo "$yaml" | grep fly_targets_${opt_target}_token_type | sed -E 's/^fly_[^=]*="(.*)"$/\1/')"
-  fly_token="$(echo "$yaml" | grep fly_targets_${opt_target}_token_value | sed -E 's/^fly_[^=]*="(.*)"$/\1/')"
-  fly_insecure="$(echo "$yaml" | grep fly_targets_${opt_target}_insecure | sed -E 's/^fly_[^=]*="(.*)"$/\1/')"
-
-  fetch_manually=true
-
-  # TODO: ask the api the version of concourse, then check for ~/.hangar/fly_<version> -- if there, use that; if not, download it
 
   local insecure_opt=''; [[ $fly_insecure == 'true' ]] && insecure_opt='-k'
   local platform=$(uname -s | tr A-Z a-z)
-  if [[ "$fly_token_type" == "Bearer" ]]
-  then
-    curl -sS ${insecure_opt} "${fly_url}/api/v1/cli?arch=amd64&platform=${platform}" -o ${FLY_CMD} -H "Authorization: Bearer $fly_token"
+  fly_curl "/api/v1/cli?arch=amd64&platform=${platform}" "${FLY_CMD}"
 
-    if [[ ! "$(file "${FLY_CMD}")" =~ ASCII\ text ]]
-    then
-      echo "Retrieved!"
-      echo ""
-      fetch_manually=false
-      chmod u+x  ${FLY_CMD}
-    fi
-  fi
-
-  if [[ "$fetch_manually" == "true" ]]
-  then
+  if [[ $? -eq 0 && ! "$(file "${FLY_CMD}")" =~ ASCII\ text ]]; then
+    echo "Retrieved!"
+    echo ""
+    chmod u+x  ${FLY_CMD}
+  else 
     echo "Could not fetch fly -- need to log in with HTTP Basic Auth"
     read -p "username: " username
     read -p "password: " -s password
     auth="$username:$password"
-    curl -sS ${insecure_opt} "${fly_url}/api/v1/cli?arch=amd64&platform=${platform}" --basic --user $auth -o ${FLY_CMD}
+    fly_curl "/api/v1/cli?arch=amd64&platform=${platform}" "${FLY_CMD}" "${auth}"
     if [[ "$(file "${FLY_CMD}")" =~ ASCII\ text ]]
     then
       rm ${FLY_CMD}
@@ -306,6 +306,10 @@ fatal() {
     echo >&2 $msg
   done
   exit 1
+}
+
+flyrc() {
+  spruce json "$HOME/.flyrc" | jq -Mrj "$1"
 }
 
 parse_yaml() {
